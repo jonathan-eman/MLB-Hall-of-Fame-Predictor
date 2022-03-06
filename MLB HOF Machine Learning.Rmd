@@ -1,0 +1,413 @@
+---
+title: "Using Machine Learning Models to Predict MLB Hall of Fame Status"
+author: "Jonathan Eman"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Set-Up
+```{r libraries, include=TRUE}
+# Load libraries used for analysis
+library(Lahman)
+library(tidyverse)
+library(MASS)
+library(klaR)
+library(ICS)
+library(ROCR)
+library(boot)
+library(ipred)
+library(car)
+library(ggcorrplot)
+library(tree) 
+library(randomForest) 
+library(gbm) 
+library(ggpubr)
+
+# Set seed so results are reproducible
+set.seed(10282019)
+```
+
+# Clean Data
+```{r data set up}
+# store base tables from Lahman package
+Fielding <- Lahman::Fielding
+Batting <- Lahman::Batting
+HallOfFame <- Lahman::HallOfFame
+
+# battingStats(Batting) adds other statistics (batting avg, on base %, etc.)
+left_join(Batting, battingStats(Batting)) -> Batting.complete
+
+# create subset of only position players (pitchers excluded from this study)
+Fielding %>%
+   dplyr::select(playerID, POS, G) %>%
+   filter(POS != "P") %>%
+   group_by(playerID) %>%
+   summarize(total.games = sum(G)) %>%
+   distinct(playerID, .keep_all = TRUE) %>%
+   filter(total.games > 10) -> Fielding.subset
+
+# calculate career batting statistics
+Batting.complete %>%
+   group_by(playerID) %>%
+   summarize(career.hr = sum(HR),
+             career.rbi = sum(RBI),
+             career.h = sum(H),
+             career.ba = sum(H)/sum(AB),
+             career.tb = sum(TB),
+             career.r = sum(R),
+             years.played = sum(stint == 1)) %>%
+   right_join(HallOfFame %>% dplyr::select(-needed_note)) %>%
+   filter(category == "Player",
+          yearID > 1970,
+          votedBy == "BBWAA",
+          years.played >= 10) %>%
+   distinct(playerID, .keep_all = TRUE) %>% # distinct keeps only info from 1st year player was eligible
+   inner_join(Fielding.subset) -> HallOfFame.batting
+
+# remove any players with missing stats
+HallOfFame.batting <- na.omit(HallOfFame.batting)
+```
+# Visualize Data
+```{r EDA, fig.width=12, fig.height=8.5}
+
+#Correlation plot for quantitative variables
+HallOfFame.batting[,c(2:8)] %>%
+   na.omit() -> HoF.bat.quant
+
+cor(HoF.bat.quant) %>% ggcorrplot::ggcorrplot(lab = TRUE)
+
+# Exploratory Data Analysis for HoF inductees vs. non-inductees
+HallOfFame.batting %>% 
+   filter(!is.na(career.ba)) %>%
+   ggplot() + geom_boxplot(aes(x=inducted, y=career.ba)) +
+   labs(x = "First Ballot Inducted Status", y = "Career Batting Average") +
+   ggtitle("Career Batting Average vs. HOF Status") +
+   scale_x_discrete(labels=c("N" = "No", "Y" = "Yes")) -> ba
+
+HallOfFame.batting %>% 
+   filter(!is.na(career.h)) %>%
+   ggplot() + geom_boxplot(aes(x=inducted, y=career.h)) +
+   labs(x = "First Ballot Inducted Status", y = "Career Hits") +
+   ggtitle("Career Hits vs. HOF Status") +
+   scale_x_discrete(labels=c("N" = "No", "Y" = "Yes")) -> h
+
+HallOfFame.batting %>% 
+   ggplot() + geom_boxplot(aes(x=inducted, y=years.played)) + 
+   labs(x = "First Ballot Inducted Status", y = "Number of Years Played") +
+   ggtitle("Career Years Played vs. HOF Status") +
+   scale_x_discrete(labels=c("N" = "No", "Y" = "Yes")) -> y
+
+HallOfFame.batting %>% 
+   filter(!is.na(career.hr)) %>%
+   ggplot() + geom_boxplot(aes(x=inducted, y=career.hr)) + 
+   labs(x = "First Ballot Inducted Status", y = "Career Homeruns") +
+   ggtitle("Career Homeruns vs. HOF Status") +
+   scale_x_discrete(labels=c("N" = "No", "Y" = "Yes")) -> hr
+
+HallOfFame.batting %>% 
+   filter(!is.na(career.rbi)) %>%
+   ggplot() + geom_boxplot(aes(x=inducted, y=career.rbi)) + 
+   labs(x = "First Ballot Inducted Status", y = "Career RBI") +
+   ggtitle("Career RBI vs. HOF Status") +
+   scale_x_discrete(labels=c("N" = "No", "Y" = "Yes")) -> rbi
+
+HallOfFame.batting %>% 
+   filter(!is.na(career.r)) %>%
+   ggplot() + geom_boxplot(aes(x=inducted, y=career.r)) + 
+   labs(x = "First Ballot Inducted Status", y = "Career Runs") +
+   ggtitle("Career Runs vs. HOF Status") +
+   scale_x_discrete(labels=c("N" = "No", "Y" = "Yes")) -> r
+
+HallOfFame.batting %>% 
+   filter(!is.na(career.tb)) %>%
+   ggplot() + geom_boxplot(aes(x=inducted, y=career.tb)) + 
+   labs(x = "First Ballot Inducted Status", y = "Career Total Bases") +
+   ggtitle("Career Total Bases vs. HOF Status") +
+   scale_x_discrete(labels=c("N" = "No", "Y" = "Yes")) -> tb
+
+ggarrange(ba, h, y, hr, rbi, r, tb, ncol = 3, nrow = 3)
+```
+
+# Modeling Phase 1: Logistic Regression and Linear Discriminant Analysis
+## Fit initial models
+```{r fit models}
+# check dummy coding of response, N=0, Y=1
+contrasts(HallOfFame.batting$inducted)
+
+# evenly split data into train and test sets
+sample.data<-sample.int(nrow(HallOfFame.batting), floor(.50*nrow(HallOfFame.batting)), replace = F)
+train<-HallOfFame.batting[sample.data, ]
+test<-HallOfFame.batting[-sample.data, ]
+
+# fit logistic regression using training data
+logistic_train<-glm(inducted ~ career.ba + career.h + career.hr + career.r + career.rbi + career.tb + years.played, family=binomial, data=train)
+
+# assess VIF and model fit
+vif(logistic_train)
+summary(logistic_train)
+
+# remove TB and re-fit model until max VIF is approximately 5 to reduce multicollinearity
+logistic_train<-glm(inducted ~ career.ba + career.h + career.hr + career.r + career.rbi + years.played, family=binomial, data=train)
+
+vif(logistic_train)
+
+logistic_train<-glm(inducted ~ career.ba + career.h + career.r + career.rbi + years.played, family=binomial, data=train)
+
+vif(logistic_train)
+
+# fit LDA using training data and same subset of variables
+lda_train <- lda(inducted ~ career.ba + career.h  + career.r + career.rbi + years.played, data=train)
+```
+## Make predictions and compare performance
+```{r}
+par(mfrow=c(1,2)) 
+
+##predicted logistic model values for test data
+preds_logistic<-predict(logistic_train, newdata=test, type="response")
+
+##produce the numbers associated with logistic classification table
+rates_logistic<-prediction(preds_logistic, test$inducted)
+
+##store the true positive and false postive rates for logistic
+roc_result_logistic<-performance(rates_logistic,measure="tpr", x.measure="fpr")
+
+##plot logistic ROC curve and overlay the diagonal line for random guessing
+plot(roc_result_logistic, main="ROC Curve for Logistic Reg.")
+lines(x = c(0,1), y = c(0,1), col="red")
+
+##predicted LDA model values for test data based on training data
+lda_test <- predict(lda_train,test)
+
+##produce the numbers associated with LDA classification table
+preds_LDA<-lda_test$posterior[,2] 
+rates_LDA<-prediction(preds_LDA, test$inducted)
+
+##store the true positive and false postive rates for LDA
+roc_result_LDA<-performance(rates_LDA,measure="tpr", x.measure="fpr")
+
+##plot LDA ROC curve and overlay the diagonal line for random guessing
+plot(roc_result_LDA, main="ROC Curve for LDA")
+lines(x = c(0,1), y = c(0,1), col="red")
+
+```
+  
+An ROC curve shows a model's trade off between the false positive rate and true positive rate. The red line represents a model that makes predictions as effective as randomly assigning a predicted class to each observation. Both of these models perform significantly better than a random guesser. 
+
+```{r AUC}
+##compute the AUC for logistic
+auc_logistic<-performance(rates_logistic, measure = "auc")
+c("Logistic", auc_logistic@y.values)
+
+##compute the AUC for LDA
+auc_LDA<-performance(rates_LDA, measure = "auc")
+c("LDA", auc_LDA@y.values)
+```
+AUC is another performance metric that quantifies the results from an ROC curve. A random guesser produces an AUC of 0.5, while a perfect AUC is 1. Both of these models have extremely high AUCs, with the LDA model performing slightly better.
+
+## Test model with categorical variable
+
+```{r}
+# create binary variable
+HallOfFame.batting %>%
+  mutate(MoreThan16Years = ifelse(years.played > 16,"Y","N") %>% factor()) ->
+  HallOfFame.batting
+
+# verify that R is treating new variable correctly, with Y=1
+contrasts(HallOfFame.batting$MoreThan16Years)
+
+
+```
+Despite the models having strong overall performance, it can be seen that many variables have extremely high p-values and thus are not contributing to the model predictions. Therefore, we decided to convert years.played to a categorical variable depending on whether they played more years than the average of players in our data, which is 16. 
+
+Since LDA can only handle numerical variables, only the logistic regression model will be re-fit with the categorical variable.
+
+```{r}
+## re-generate train/test
+set.seed(10282019)
+
+sample.data<-sample.int(nrow(HallOfFame.batting), floor(.50*nrow(HallOfFame.batting)), replace = F)
+train<-HallOfFame.batting[sample.data, ]
+test<-HallOfFame.batting[-sample.data, ]
+
+##fit logistic regression using training data
+logistic_train_cat<-glm(inducted ~ career.ba + career.h + career.r + career.rbi + MoreThan16Years, family=binomial, data=train)
+```
+
+```{r recreate ROC}
+##predicted logistic model values for test data
+preds_logistic_cat<-predict(logistic_train_cat, newdata=test, type="response")
+
+##produce the numbers associated with logistic classification table
+rates_logistic_cat<-prediction(preds_logistic_cat, test$inducted)
+
+##store the true positive and false postive rates for logistic
+roc_result_logistic_cat<-performance(rates_logistic_cat,measure="tpr", x.measure="fpr")
+
+##plot logistic ROC curve and overlay the diagonal line for random guessing
+plot(roc_result_logistic_cat, main="ROC Curve for Logistic Regression")
+lines(x = c(0,1), y = c(0,1), col="red")
+
+##compute the AUC for logistic
+auc_logistic_cat<-performance(rates_logistic_cat, measure = "auc")
+auc_logistic_cat@y.values
+```
+This new model results in a small increase to the AUC.
+
+# Modeling Phase 2: Decision Trees
+## Recursive Binary Splitting
+```{r}
+# store actual inducted values from test data
+pred.test<-test[,"inducted"]
+
+tree.class.train<-tree(inducted~career.hr+career.rbi+career.h+career.ba+career.tb+career.r+years.played, data=train)
+
+summary(tree.class.train)
+
+plot(tree.class.train)
+text(tree.class.train, cex=0.75, pretty=0)
+
+##find predicted classes for test data
+tree.pred.test<-predict(tree.class.train, newdata=test, type="class") %>%
+   as.data.frame()
+
+# ##confusion matrix for test data
+##actual classes in rows, predicted classes in columns
+
+test %>%
+   mutate(accurate = tree.pred.test==pred.test) %>%
+   group_by(inducted, accurate) %>%
+   summarize(count = n()) -> confusion.data
+
+matrix(c(
+   confusion.data[2,3],
+   confusion.data[1,3],
+   confusion.data[3,3],
+   confusion.data[4,3]),
+   nrow = 2, byrow = TRUE) -> confusion.matrix.rbs
+
+colnames(confusion.matrix.rbs) <- c("No-Pred.", "Yes-Pred.")
+rownames(confusion.matrix.rbs) <- c("No", "Yes")
+
+confusion.matrix.rbs
+
+##overall error rate
+1-mean(tree.pred.test==pred.test)
+```
+
+## Pruning
+```{r}
+### Pruning
+cv.class <- cv.tree(tree.class.train, K=10, FUN=prune.misclass)
+cv.class
+
+##plot of dev against size
+plot(cv.class$size, cv.class$dev,type='b')
+
+##size of tree chosen by pruning
+trees.num.class<-cv.class$size[which.min(cv.class$dev)]
+trees.num.class 
+
+##fit tree with size chosen by pruning
+prune.class <- prune.misclass(tree.class.train, best=trees.num.class)
+
+##plot pruned tree
+plot(prune.class)
+text(prune.class, cex=0.75, pretty=0)
+
+##prediction based on pruned tree for test data
+tree.pred.prune <- predict(prune.class, newdata=test, type="class") %>%
+   as.data.frame()
+
+test %>%
+   mutate(accurate = tree.pred.prune==pred.test) %>%
+   group_by(inducted, accurate) %>%
+   summarize(count = n()) -> confusion.data
+
+matrix(c(
+   confusion.data[2,3],
+   confusion.data[1,3],
+   confusion.data[3,3],
+   confusion.data[4,3]),
+   nrow = 2, byrow = TRUE) -> confusion.matrix.prune
+
+colnames(confusion.matrix.prune) <- c("No-Pred.", "Yes-Pred.")
+rownames(confusion.matrix.prune) <- c("No", "Yes")
+
+confusion.matrix.prune
+
+##overall overall error rate
+1-mean(tree.pred.prune == pred.test) 
+```
+
+## Bagging
+```{r}
+# fit model
+bag.class<-randomForest(inducted~career.hr+career.rbi+career.h+career.ba+career.tb+career.r+years.played, data=train, mtry=7, importance=TRUE)
+bag.class ##note with classification tree OOB estimates are provided
+
+##importance measures of predictors
+importance(bag.class)
+##graphical version
+varImpPlot(bag.class)
+
+##test error rate with bagging
+pred.bag<-predict(bag.class, newdata=test) %>% as.data.frame()
+
+test %>%
+   mutate(accurate = pred.bag==pred.test) %>%
+   group_by(inducted, accurate) %>%
+   summarize(count = n()) -> confusion.data
+
+matrix(c(
+   confusion.data[2,3],
+   confusion.data[1,3],
+   confusion.data[3,3],
+   confusion.data[4,3]),
+   nrow = 2, byrow = TRUE) -> confusion.matrix.bag
+
+colnames(confusion.matrix.bag) <- c("No-Pred.", "Yes-Pred.")
+rownames(confusion.matrix.bag) <- c("No", "Yes")
+
+confusion.matrix.bag
+
+1-mean(pred.bag==pred.test) 
+```
+
+## Random Forests
+```{r}
+## Random Forests
+rf.class<-randomForest(inducted~career.hr+career.rbi+career.h+career.ba+career.tb+career.r+years.played, data=train, mtry=3,importance=TRUE)
+rf.class
+
+importance(rf.class)
+varImpPlot(rf.class)
+
+summary(rf.class)
+
+##test error rate with Random Forest
+pred.rf<-predict(rf.class, newdata=test) %>% as.data.frame()
+
+test %>%
+   mutate(accurate = pred.rf == pred.test) %>%
+   group_by(inducted, accurate) %>%
+   summarize(count = n()) -> confusion.data
+
+matrix(c(
+   confusion.data[2,3],
+   confusion.data[1,3],
+   confusion.data[3,3],
+   confusion.data[4,3]),
+   nrow = 2, byrow = TRUE) -> confusion.matrix.rf
+
+colnames(confusion.matrix.rf) <- c("No-Pred.", "Yes-Pred.")
+rownames(confusion.matrix.rf) <- c("No", "Yes")
+
+confusion.matrix.rf
+
+1-mean(pred.rf==pred.test)
+```
+
+See the slide deck included in this repository for an analysis of our results and conclusions.
