@@ -20,6 +20,7 @@ library(tree)
 library(randomForest) 
 library(gbm) 
 library(ggpubr)
+library(caret)
 
 # Set seed so results are reproducible
 set.seed(10282019)
@@ -149,6 +150,8 @@ contrasts(HallOfFame.batting$inducted)
 
 ``` r
 # evenly split data into train and test sets
+set.seed(10282019)
+
 sample.data<-sample.int(nrow(HallOfFame.batting), floor(.50*nrow(HallOfFame.batting)), replace = F)
 train<-HallOfFame.batting[sample.data, ]
 test<-HallOfFame.batting[-sample.data, ]
@@ -293,6 +296,57 @@ AUC is another performance metric that quantifies the results from an
 ROC curve. A random guesser produces an AUC of 0.5, while a perfect AUC
 is 1. Both of these models have extremely high AUCs, with the LDA model
 performing slightly better.
+
+``` r
+# set threshold for positive classification
+confusion.matrix.logistic <- table(test$inducted,preds_logistic > 0.3)
+overall.error.logistic<-(confusion.matrix.logistic[1,2] + confusion.matrix.logistic[2,1])/sum(confusion.matrix.logistic)
+
+confusion.matrix.logistic
+```
+
+    ##    
+    ##     FALSE TRUE
+    ##   N   218    8
+    ##   Y     3    7
+
+``` r
+overall.error.logistic 
+```
+
+    ## [1] 0.04661017
+
+``` r
+# set threshold for positive classification
+confusion.matrix.lda <- table(test$inducted,preds_LDA > 0.3)
+overall.error.lda<-(confusion.matrix.lda[1,2] + confusion.matrix.lda[2,1])/sum(confusion.matrix.lda)
+
+confusion.matrix.lda
+```
+
+    ##    
+    ##     FALSE TRUE
+    ##   N   220    6
+    ##   Y     3    7
+
+``` r
+overall.error.lda 
+```
+
+    ## [1] 0.03813559
+
+Looking at confusion matrices here is important because our positive
+classification (being inducted into the hall of fame) is a rare event.
+Even an extremely high error rate does not indicate strong predictive
+power because a model could classify each observation as the negative
+class and still have a high error rate. We want to minimize our number
+of false negatives (actual=Y, predicted=FALSE), without false positives
+(actual=N, predicted=TRUE) becoming too high, so we can manually adjust
+the threshold for positive classification until we optimize this
+balance.
+
+At a threshold of 0.3, we can see that LDA outperforms logistic
+regression, though the false negative rate of 30% is still quite high.
 
 ## Test model with categorical variable
 
