@@ -25,6 +25,7 @@ library(tree)
 library(randomForest) 
 library(gbm) 
 library(ggpubr)
+library(caret)
 
 # Set seed so results are reproducible
 set.seed(10282019)
@@ -138,6 +139,8 @@ ggarrange(ba, h, y, hr, rbi, r, tb, ncol = 3, nrow = 3)
 contrasts(HallOfFame.batting$inducted)
 
 # evenly split data into train and test sets
+set.seed(10282019)
+
 sample.data<-sample.int(nrow(HallOfFame.batting), floor(.50*nrow(HallOfFame.batting)), replace = F)
 train<-HallOfFame.batting[sample.data, ]
 test<-HallOfFame.batting[-sample.data, ]
@@ -191,7 +194,6 @@ roc_result_LDA<-performance(rates_LDA,measure="tpr", x.measure="fpr")
 ##plot LDA ROC curve and overlay the diagonal line for random guessing
 plot(roc_result_LDA, main="ROC Curve for LDA")
 lines(x = c(0,1), y = c(0,1), col="red")
-
 ```
   
 An ROC curve shows a model's trade off between the false positive rate and true positive rate. The red line represents a model that makes predictions as effective as randomly assigning a predicted class to each observation. Both of these models perform significantly better than a random guesser. 
@@ -206,6 +208,25 @@ auc_LDA<-performance(rates_LDA, measure = "auc")
 c("LDA", auc_LDA@y.values)
 ```
 AUC is another performance metric that quantifies the results from an ROC curve. A random guesser produces an AUC of 0.5, while a perfect AUC is 1. Both of these models have extremely high AUCs, with the LDA model performing slightly better.
+
+```{r confusion matrix}
+# set threshold for positive classification
+confusion.matrix.logistic <- table(test$inducted,preds_logistic > 0.3)
+overall.error.logistic<-(confusion.matrix.logistic[1,2] + confusion.matrix.logistic[2,1])/sum(confusion.matrix.logistic)
+
+confusion.matrix.logistic
+overall.error.logistic 
+
+# set threshold for positive classification
+confusion.matrix.lda <- table(test$inducted,preds_LDA > 0.3)
+overall.error.lda<-(confusion.matrix.lda[1,2] + confusion.matrix.lda[2,1])/sum(confusion.matrix.lda)
+
+confusion.matrix.lda
+overall.error.lda 
+```
+Looking at confusion matrices here is important because our positive classification (being inducted into the hall of fame) is a rare event. Even an extremely high error rate does not indicate strong predictive power because a model could classify each observation as the negative class and still have a high error rate. We want to minimize our number of false negatives (actual=Y, predicted=FALSE), without false positives (actual=N, predicted=TRUE) becoming too high, so we can manually adjust the threshold for positive classification until we optimize this balance.
+
+At a threshold of 0.3, we can see that LDA outperforms logistic regression, though the false negative rate of 30% is still quite high.
 
 ## Test model with categorical variable
 
